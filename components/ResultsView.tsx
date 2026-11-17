@@ -134,7 +134,7 @@ export default function ResultsView({ result: r }: { result: MatchResult }) {
               ["Comparable companies", String(r.comps.length), "raised in the last 18 months"],
               ["Investors ranked", String(r.investors.length), "scored for your stage & sector"],
               ["Top match score", r.investors[0] ? `${r.investors[0].matchScore}/100` : "—", r.investors[0]?.name ?? ""],
-              ["Proof links", String(r.sources.length), "every match is clickable"],
+              ["Proof links", String(r.comps.length), "one per comparable — all clickable"],
             ].map(([k, v, sub]) => (
               <div key={k} className="rounded-xl border border-line bg-panel p-4 shadow-card">
                 <p className="text-[12px] font-medium uppercase tracking-wider text-slate-500">{k}</p>

@@ -123,6 +123,65 @@ Judge-gaps found & fixed during this pass:
   `/api/match`, custom 404.
 - Production server smoke test: all pages 200, unknown route 404, API index/preset/POST flows as above.
 
+## Live-QA fixes (pass 3 — 17 Nov 2026, after first deployed review)
+
+**Issue 1 — proof links pointed at publisher homepages (fixed).** Every comparable in all 3 presets
+now links to the specific article reporting its round. All 33 URLs were found via search and
+fetch-verified on 17 Nov 2026 (page loads + covers that company's raise). Source mix: news articles
+(TechCrunch ×3, Moneycontrol ×3, Entrackr ×3, Entrepreneur India ×4, Inc42 ×2, SiliconANGLE ×2,
+IPO Central, VCCircle, The Hindu BusinessLine, YourStory, MLQ.ai, VieStories), investor/firm pages
+(Lightspeed's Macroscope announcement, Vertex Ventures' Pilgrim story, Saama Capital's Mokobara
+post), a Globe Newswire press release (Cline), a company newsroom page (CodeRabbit), an Inc42
+article syndicated on NewsPoint (Dhan), and 2 funding-database profiles where no verbatim article
+URL could be verified (Cursor via LeadWave, Bito via KingsCrowd).
+
+Row facts corrected to match the linked articles:
+- Fintech: Easebuzz $30M → $28M (₹240 Cr total round); Snapmint's lead was **General Atlantic**,
+  not General Catalyst, and the round is a Series B — investor card #6 renamed accordingly
+  (partner: Shantanu Rastogi, MD & Head of India); Dhan "Growth Round" → Series B; Skydo was a
+  $10M Series A (Dec 2025, led by Susquehanna Asia VC, Elevation participated), not a $5M seed;
+  Xflow was $16.6M led by General Catalyst (Feb 2026), not $16M led by Lightspeed; Dodo Payments
+  was a $1.1M pre-seed (Antler, 9Unicorns, Venture Catalysts), not $3.25M.
+- Devtools: Qodo's recent round is a $70M Series B (Mar 2026, Qumra Capital), not the Sep 2024
+  $40M Series A; CodeAnt AI raised a $2M seed (May 2025, YC + Uncorrelated), not $7M; Bito's recent
+  round is a $5.7M seed extension (2025, Vela Partners) — no $12M "Eka Ventures" Series A exists;
+  Continue raised $3M seed (Feb 2025, Heavybit), not undisclosed. Three rows were unsalvageable
+  and replaced with verified comparables: Codegen → **Factory** ($50M Series B, Sep 2025),
+  Sweep → **Cline** ($32M Seed + Series A, Jul 2025), Tembo → **Cursor/Anysphere** ($900M Series C,
+  Jun 2025). YC and a16z cards rewritten to match their new backed sets (YC: CodeAnt only;
+  a16z: Cursor).
+- D2C: Foxtale round is a Series C with Z47 + Kae Capital also in; Deconstruct is a Series A
+  (Jan 2025) with V3 Ventures also in; Pilgrim row now reflects the real Fireside/Vertex-led
+  ₹75 Cr (~$9M) Series B extension (Sep 2024) — the larger Mar 2025 round did not include
+  Fireside and would have left the #1 card proofless; The Whole Truth closed Feb 2025 (not Jan)
+  with Peak XV + Sauce.vc also in; Mokobara's $12M Series B was Feb 2024 (not 2025), with
+  Sauce VC + Saama Capital; Hyphen never raised a VC seed — its first round was a ₹30 Cr
+  strategic investment by PEP Technologies (Jul 2023); ClayCo raised a $2M Series A from
+  Unilever Ventures (Oct 2024), not an undisclosed seed; WishCare raised ₹20 Cr (~$2.4M) from
+  Unilever Ventures (Nov 2023), not an undisclosed 2025 seed; Fae Beauty raised ₹17 Cr (~$2M)
+  led by Spring Marketing Capital (Nov 2025), not angels-only; Beco's round is a $10M
+  **pre-Series B** led by Tanglin (Aug 2024) — Info Edge Ventures was not in it. Gush Beauty had
+  no verifiable institutional round at all → replaced by **RAS Luxury Skincare** ($5M Series A
+  led by Unilever Ventures, Jan 2025). DSG card rewritten (Deconstruct only); Unilever Ventures
+  card now counts 3 backed comps; Peak XV card now counts 2 (Mokobara + The Whole Truth).
+- Honest-window note: with verified data, several preset rounds fall outside a strict 18-month
+  window (2023–24 rows kept because they are the rounds that actually back the ranked investors).
+  Demo copy/caveats updated from "2025 raises" to "2023–26 coverage" to match.
+
+**Issue 2 — "Proof links" stat counted distinct publishers (fixed).** `components/ResultsView.tsx`
+now counts `r.comps.length` (one proof link per comparable, all clickable) instead of
+`r.sources.length` (URL-deduped, which showed 4 or 2).
+
+**Methodology consistency check (no change needed).** The live-QA paraphrase ("Portfolio fit 40,
+Stage fit 20…") appears nowhere in the repo. The methodology page, `lib/extract.ts`
+(`rankInvestors`: comparable deals ≤34 via `min(34, n×14)`, stage fit +16/+20, sector overlap
+≤20 via `min(20, overlap×4)`, geography +14, recency +10, score clamped to [5, 98]) and this plan
+all agree. Page text left as-is.
+
+**Verification:** `npm run build` passes; production-server integrity check — each preset: 11
+comps, 11 unique article-level source URLs, 0 homepage links, every investor card backed by ≥1
+comp with a proof URL, no orphan proof chips, scores strictly descending.
+
 ## Still open (needs Neyab / parent agent)
 
 1. **Live key test** — no `TINYFISH_API_KEY` in this VM (by design). First live run should verify:
