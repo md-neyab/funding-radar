@@ -46,7 +46,8 @@ agents build it from the live web → structured, source-backed rows. It has a *
 
 **How Radar uses it (genuinely, no fakery):** the comparable-companies set *is* a TinySet dataset.
 Radar sends a self-written 8-column spec (company key, what_it_does, country, round, amount_usd, date,
-investors, source_url) scoped from the founder's description, `target_rows: 15`. It then polls status
+investors, source_url) scoped from the founder's description, `target_rows: 10` (lowered from 15 in
+pass 4 — wallet protection). It then polls status
 for a bounded 75 s window and reads back landed rows (rows stream, so partial sets are usable).
 The dataset ID + rows used are recorded in the result and shown in the "How this shortlist was built"
 panel. If creation fails or no rows land in time, the step log says exactly that and Search+Fetch build
@@ -182,11 +183,84 @@ all agree. Page text left as-is.
 comps, 11 unique article-level source URLs, 0 homepage links, every investor card backed by ≥1
 comp with a proof URL, no orphan proof chips, scores strictly descending.
 
+## Wallet protection (pass 4 — 17 Nov 2026, after Neyab's wallet-drain concern)
+
+Neyab's point: once the key is live on the public site, anyone (including judges) can trigger
+searches; if the $8 wallet drains, the site must not look broken. Implemented in a new server-side
+module `lib/quota.ts` + pipeline/route changes:
+
+1. **Cheaper run** — TinySet `target_rows` 15 → **10** (the brief's minimum), ≈ **$1.00** dataset
+   cost per live run (was ≈ $1.50); Search/Fetch top-up unchanged. Copy updated in README,
+   methodology page, `.env.example` and this plan.
+2. **Daily live-search cap: 8/UTC day** — in-memory counter keyed by UTC date; the slot is
+   reserved *before* the run starts (slow/failed/parallel runs count). Presets and cache hits
+   never count. Code comments + README state the serverless caveat plainly: per-instance,
+   best-effort — the credits-error fallback is the hard backstop.
+3. **Result cache** — in-memory, keyed by normalized (description + stage + country + sector).
+   A repeat returns the stored live result with a first pipeline step *"Served from cache — no
+   TinyFish credits spent"* and does not consume a cap slot. `GET /api/match` now also reports
+   `liveBudget` (cap/used/remaining) in live mode.
+4. **Graceful quota fallback** — `MatchResult.notice: "live-quota"` + `quotaFallbackResult()` in
+   the pipeline. Triggered when (a) the daily cap is reached, or (b) TinyFish returns a credits
+   error (HTTP 402 / INSUFFICIENT_CREDITS detected via `isCreditsError`) at ANY stage — TinySet
+   create (remaining steps skipped immediately), Search (mid-loop), or Fetch — preserving the
+   honest steps that already ran/spent in front of the log, plus a switch step explaining why.
+   The UI renders a sky "Live search is resting" banner (`QuotaBanner`, replacing the demo
+   banner for these results), the worked example is the closest preset (keyword match, else
+   country default), labelled as sample everywhere. No error page is ever produced for money.
+5. **Recent live searches (user addition, same pass)** — completed genuine live runs are
+   recorded in the same in-memory store (summaries only, deduped by cache key, max 12 kept).
+   `GET /api/recent` returns the last 6. The homepage renders "Recent live searches — free to
+   re-open, no credits spent" cards (section `#recent-live`) that re-POST the stored parameters
+   and land on the cache hit. Presets/demo/fallbacks/cache hits are never recorded. Empty list
+   (always in demo mode) renders nothing. The per-browser localStorage "Your recent searches"
+   is untouched.
+
+**Test hook (documented in README + `.env.example`):** quota logic is verifiable without real
+credits only when `FUNDING_RADAR_ENABLE_TEST_HOOKS=1`; then `FUNDING_RADAR_SIMULATE_QUOTA=cap`
+makes the cap behave as reached, `=credits` makes a live run fail as if TinySet returned
+402 INSUFFICIENT_CREDITS. Inert otherwise; must never be set in production.
+
+**Verification (production server, dummy key):** 12/12 API checks passed — preset intact; a
+custom search took the live path and was recorded (budget 1 used / 7 remaining); `/api/recent`
+listed it; the identical repeat was a cache hit with the cache step and consumed no slot;
+`SIMULATE_QUOTA=cap` returned the worked example with `notice: "live-quota"`, honest log and
+caveat, and recorded nothing; `SIMULATE_QUOTA=credits` returned the fallback with the simulated
+TinySet failure step followed by the switch step. Server-side render of `ResultsView` with the
+credits-fallback result confirmed: quota banner renders, generic demo banner suppressed, sample
+labelling intact. `npm run build` passes.
+
+## Mobile UX (pass 5 — 17 Nov 2026, from Neyab's phone screenshot of a results card)
+
+Desktop is pixel-identical: every changed desktop value is restored via `sm:`/`md:` variants
+(diff-reviewed class by class).
+
+1. **Tighter mobile width** — page container (layout + nav + footer) `px-4` → `px-3` on mobile
+   (`sm:px-6` untouched); results panels/cards `p-5` → `p-4 md:p-5`, `p-6` → `p-4 md:p-6`,
+   stat cards `p-4` → `p-3 md:p-4`, card inner gap `gap-4` → `gap-3 md:gap-4`.
+2. **Compact investor cards on mobile** — per-card `expandedCards` state. Collapsed (mobile
+   only): rank chip, firm name, score, why clamped to 2 lines (`line-clamp-2 md:line-clamp-none`),
+   a one-line "Typical cheque: …" (`md:hidden`), and a "Details ▾" button (`md:hidden`). The
+   score breakdown, cheque/partner/reach grid and proof chips sit in a `hidden md:block`
+   wrapper until expanded; on `md:` everything is always visible exactly as before and no
+   Details button exists. Verified in the built CSS (`line-clamp-2`, `md:line-clamp-none`,
+   `md:hidden` all generated) and in the SSR render check (wrapper classes + button present).
+3. **No dead ends** — the results empty state (`no_matches`), the `/results` "no result yet"
+   state, and the founder-form error box now all offer **"See a demo result"** (loads the
+   Indian-fintech preset result) and **"Recent results"** (links to `/#recent-live`, the
+   homepage recent-live-searches section; that section carries `id="recent-live"` +
+   `scroll-mt-24`). The form's demo button reuses its existing preset runner.
+
+**Verification:** `npm run build` passes; class-by-class diff review confirms every pre-existing
+desktop (≥768px) class value is unchanged; SSR render check confirms the compact-card markup.
+
 ## Still open (needs Neyab / parent agent)
 
 1. **Live key test** — no `TINYFISH_API_KEY` in this VM (by design). First live run should verify:
-   TinySet dataset creation on Neyab's account (wallet $8 ≈ 80 rows max; Radar requests 15 rows ≈ $1.50),
-   the rows' column names match the spec, and the Agent verify step's response shape.
+   TinySet dataset creation on Neyab's account (wallet $8 ≈ 80 rows max; Radar requests 10 rows ≈ $1.00
+   since pass 4), the rows' column names match the spec, and the Agent verify step's response shape.
+   Wallet protection (pass 4) is in place for this: 8 live searches/day cap + cache + quota fallback,
+   so judges testing the live site cannot drain the wallet or hit a broken-looking page.
 2. **Screenshots** for README + submission media (≤5 files allowed on the claim form).
 3. **GitHub repo + deployment** — not done here (explicitly out of scope for this build task);
    submission needs a demo URL or repo link.

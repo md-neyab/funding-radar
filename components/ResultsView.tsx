@@ -3,8 +3,8 @@
 import { Fragment, useEffect, useState } from "react";
 import Link from "next/link";
 import type { MatchResult } from "@/lib/types";
-import { DemoBanner } from "./ui";
-import { isSavedInvestor, toggleSavedInvestor } from "@/lib/storage";
+import { DemoBanner, QuotaBanner } from "./ui";
+import { isSavedInvestor, saveLastResult, toggleSavedInvestor } from "@/lib/storage";
 
 function toCSV(rows: string[][]): string {
   return rows.map((r) => r.map((c) => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
@@ -43,6 +43,7 @@ function summaryText(r: MatchResult): string {
   const lines = [
     `Funding Radar — investor matches for: "${r.input.description}" (${r.input.stage}, ${r.input.country})`,
     `Generated ${new Date(r.generatedAt).toLocaleString()} · Mode: ${r.mode} · ${r.comps.length} comparable companies, ${r.investors.length} ranked investors`,
+    ...(r.notice === "live-quota" ? ["Note: live search was resting (daily budget reached or credits ran out), so this is a worked example — not a live run for the exact description above."] : []),
     "",
     "Ranked investors:",
   ];
@@ -70,6 +71,28 @@ export default function ResultsView({ result: r }: { result: MatchResult }) {
   const [saved, setSaved] = useState<Record<string, boolean>>({});
   const [expandedComp, setExpandedComp] = useState<string | null>(null);
   const [showSteps, setShowSteps] = useState(false);
+  // Mobile only: investor cards start compact; "Details" expands one card.
+  // On md+ screens every section is always visible (CSS-driven, see card).
+  const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>({});
+  const [loadingDemo, setLoadingDemo] = useState(false);
+
+  async function loadDemoResult() {
+    setLoadingDemo(true);
+    try {
+      const res = await fetch("/api/match", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ presetId: "indian-fintech" }),
+      });
+      const data = await res.json();
+      if (data?.result) {
+        saveLastResult(data.result);
+        window.location.reload();
+        return;
+      }
+    } catch { /* fall through to re-enable the button */ }
+    setLoadingDemo(false);
+  }
 
   useEffect(() => {
     const map: Record<string, boolean> = {};
@@ -87,7 +110,7 @@ export default function ResultsView({ result: r }: { result: MatchResult }) {
 
   return (
     <div className="space-y-8">
-      {r.mode === "demo" && <DemoBanner />}
+      {r.notice === "live-quota" ? <QuotaBanner /> : r.mode === "demo" && <DemoBanner />}
 
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="max-w-2xl">
@@ -110,14 +133,20 @@ export default function ResultsView({ result: r }: { result: MatchResult }) {
       </div>
 
       {r.status === "no_matches" && (
-        <div className="rounded-xl border border-line bg-panel p-6" role="alert">
+        <div className="rounded-xl border border-line bg-panel p-4 md:p-6" role="alert">
           <h2 className="text-lg font-semibold text-white">No matches to show for this description yet</h2>
           <p className="mt-1 max-w-2xl text-sm leading-relaxed text-slate-400">
             {r.mode === "demo"
               ? "This build is in demo mode: full sample results exist for the three preset startups on the home page. Add a TinyFish API key on the server and this exact description gets researched live — TinySet dataset, Search, Fetch and Agent."
               : "Radar could not verify enough comparable companies with proof links for this description. Try naming the sector and customer more concretely (for example “AI code-review tool for engineering teams” rather than “AI tool”), or re-run shortly — the TinySet dataset may still be building."}
           </p>
-          <Link href="/" className="mt-4 inline-block rounded-lg bg-mint px-4 py-2 text-sm font-semibold text-ink hover:bg-emerald-300">Back to the form</Link>
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <button type="button" onClick={loadDemoResult} disabled={loadingDemo} className="rounded-lg bg-mint px-4 py-2 text-sm font-semibold text-ink transition hover:bg-emerald-300 disabled:opacity-60">
+              {loadingDemo ? "Loading demo…" : "See a demo result"}
+            </button>
+            <Link href="/#recent-live" className="rounded-lg border border-line px-4 py-2 text-sm font-medium text-slate-200 transition hover:border-mint/40 hover:text-mint">Recent results</Link>
+            <Link href="/" className="rounded-lg px-4 py-2 text-sm font-medium text-slate-300 underline-offset-2 transition hover:text-mint hover:underline">Back to the form</Link>
+          </div>
         </div>
       )}
 
@@ -136,7 +165,7 @@ export default function ResultsView({ result: r }: { result: MatchResult }) {
               ["Top match score", r.investors[0] ? `${r.investors[0].matchScore}/100` : "—", r.investors[0]?.name ?? ""],
               ["Proof links", String(r.comps.length), "one per comparable — all clickable"],
             ].map(([k, v, sub]) => (
-              <div key={k} className="rounded-xl border border-line bg-panel p-4 shadow-card">
+              <div key={k} className="rounded-xl border border-line bg-panel p-3 shadow-card md:p-4">
                 <p className="text-[12px] font-medium uppercase tracking-wider text-slate-500">{k}</p>
                 <p className="mt-1 truncate text-2xl font-bold text-white">{v}</p>
                 <p className="mt-1 truncate text-[12px] text-slate-400">{sub}</p>
@@ -144,7 +173,7 @@ export default function ResultsView({ result: r }: { result: MatchResult }) {
             ))}
           </section>
 
-          <section className="rounded-xl border border-line bg-panel p-5" aria-label="How this result was built">
+          <section className="rounded-xl border border-line bg-panel p-4 md:p-5" aria-label="How this result was built">
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">How this shortlist was built</h2>
             <p className="mt-2 text-sm leading-relaxed text-slate-300">
               <strong className="text-white">TinySet</strong> {r.tinyset.attempted ? <>dataset <span className="font-mono text-[12px]">{r.tinyset.datasetId ?? ""}</span> supplied {r.tinyset.rowsUsed} comparable rows. </> : <>supplies the comparable-companies dataset in live mode. </>}
@@ -164,8 +193,8 @@ export default function ResultsView({ result: r }: { result: MatchResult }) {
             <h2 className="text-xl font-semibold tracking-tight text-white">Ranked investors to approach</h2>
             <ol className="mt-4 space-y-4">
               {r.investors.map((inv) => (
-                <li key={inv.name} className="rounded-2xl border border-line bg-panel p-5 shadow-card">
-                  <div className="flex items-start gap-4">
+                <li key={inv.name} className="rounded-2xl border border-line bg-panel p-4 shadow-card md:p-5">
+                  <div className="flex items-start gap-3 md:gap-4">
                     <div className="flex flex-col items-center gap-1">
                       <span className="flex h-8 w-8 items-center justify-center rounded-full bg-mint/10 font-mono text-sm font-bold text-mint ring-1 ring-inset ring-mint/30">#{inv.rank}</span>
                     </div>
@@ -183,7 +212,13 @@ export default function ResultsView({ result: r }: { result: MatchResult }) {
                           {saved[inv.name] ? "★ Saved" : "☆ Save"}
                         </button>
                       </div>
-                      <p className="mt-2 text-sm leading-relaxed text-slate-300"><span className="font-medium text-slate-100">Why #{inv.rank}:</span> {inv.whyRank}</p>
+                      <p className={`mt-2 text-sm leading-relaxed text-slate-300 ${expandedCards[inv.name] ? "" : "line-clamp-2 md:line-clamp-none"}`}><span className="font-medium text-slate-100">Why #{inv.rank}:</span> {inv.whyRank}</p>
+                      {!expandedCards[inv.name] && (
+                        <p className="mt-1.5 text-[13px] text-slate-400 md:hidden">
+                          Typical cheque: <span className="font-medium text-slate-200">{inv.chequeLabel}</span>
+                        </p>
+                      )}
+                      <div className={expandedCards[inv.name] ? undefined : "hidden md:block"}>
                       <details className="mt-2">
                         <summary className="cursor-pointer text-[13px] font-medium text-sky2 hover:text-mint">How the score was computed</summary>
                         <ul className="mt-1.5 list-disc space-y-0.5 pl-5 text-[13px] text-slate-400">
@@ -223,6 +258,15 @@ export default function ResultsView({ result: r }: { result: MatchResult }) {
                           ))}
                         </ul>
                       </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setExpandedCards((s) => ({ ...s, [inv.name]: !s[inv.name] }))}
+                        aria-expanded={!!expandedCards[inv.name]}
+                        className="no-print mt-3 rounded-lg border border-line px-3.5 py-2 text-[13px] font-medium text-mint transition hover:border-mint/40 md:hidden"
+                      >
+                        {expandedCards[inv.name] ? "Hide details ▴" : "Details ▾"}
+                      </button>
                     </div>
                     <ScoreRing score={inv.matchScore} />
                   </div>
@@ -294,7 +338,7 @@ export default function ResultsView({ result: r }: { result: MatchResult }) {
 
       {/* Pipeline log */}
       {r.steps.length > 0 && (
-        <section className="no-print rounded-xl border border-line bg-panel p-5" aria-label="Pipeline log">
+        <section className="no-print rounded-xl border border-line bg-panel p-4 md:p-5" aria-label="Pipeline log">
           <button type="button" onClick={() => setShowSteps((v) => !v)} className="flex w-full items-center justify-between text-left" aria-expanded={showSteps}>
             <span className="text-sm font-semibold uppercase tracking-wider text-slate-300">Pipeline log — what actually ran</span>
             <span className="text-slate-400">{showSteps ? "−" : "+"}</span>

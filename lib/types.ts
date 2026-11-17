@@ -76,6 +76,14 @@ export interface MatchResult {
   input: FounderInput;
   mode: "live" | "demo";
   presetId?: string;
+  /**
+   * "live-quota" — this result is a worked example served INSTEAD of a live
+   * run because live search is resting: either the daily live-search cap was
+   * reached or TinyFish reported insufficient credits. The UI shows a
+   * friendly banner (never an error page) and the result is labelled as a
+   * worked example everywhere. See lib/quota.ts.
+   */
+  notice?: "live-quota";
   generatedAt: string;
   comps: ComparableCompany[];
   investors: RankedInvestor[];

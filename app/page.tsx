@@ -1,5 +1,6 @@
 import Link from "next/link";
 import FounderForm from "@/components/FounderForm";
+import RecentLiveSearches from "@/components/RecentLiveSearches";
 import { RadarMark } from "@/components/ui";
 
 const FEATURES = [
@@ -45,6 +46,8 @@ export default function HomePage() {
           <FounderForm />
         </div>
       </section>
+
+      <RecentLiveSearches />
 
       <section aria-label="What you get" className="grid gap-4 md:grid-cols-3">
         {FEATURES.map((f) => (

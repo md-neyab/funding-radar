@@ -3,12 +3,31 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import type { MatchResult } from "@/lib/types";
-import { getLastResult } from "@/lib/storage";
+import { getLastResult, saveLastResult } from "@/lib/storage";
 import ResultsView from "@/components/ResultsView";
 
 export default function ResultsPage() {
   const [result, setResult] = useState<MatchResult | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [loadingDemo, setLoadingDemo] = useState(false);
+
+  async function loadDemoResult() {
+    setLoadingDemo(true);
+    try {
+      const res = await fetch("/api/match", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ presetId: "indian-fintech" }),
+      });
+      const data = await res.json();
+      if (data?.result) {
+        saveLastResult(data.result);
+        window.location.reload();
+        return;
+      }
+    } catch { /* fall through to re-enable the button */ }
+    setLoadingDemo(false);
+  }
 
   useEffect(() => {
     setResult(getLastResult());
@@ -30,15 +49,23 @@ export default function ResultsPage() {
 
   if (!result) {
     return (
-      <div className="mx-auto max-w-xl rounded-xl border border-line bg-panel p-8 text-center">
+      <div className="mx-auto max-w-xl rounded-xl border border-line bg-panel p-5 text-center md:p-8">
         <h1 className="text-xl font-semibold text-white">No result to show yet</h1>
         <p className="mt-2 text-sm leading-relaxed text-slate-400">
           Results appear here after you run a search or load a demo preset. They are kept in this browser
           only, so opening this page in a fresh tab or a new device starts empty.
         </p>
-        <Link href="/" className="mt-5 inline-block rounded-lg bg-mint px-4 py-2 text-sm font-semibold text-ink hover:bg-emerald-300">
-          Describe your startup
-        </Link>
+        <div className="mt-5 flex flex-wrap justify-center gap-2">
+          <button type="button" onClick={loadDemoResult} disabled={loadingDemo} className="rounded-lg bg-mint px-4 py-2 text-sm font-semibold text-ink transition hover:bg-emerald-300 disabled:opacity-60">
+            {loadingDemo ? "Loading demo…" : "See a demo result"}
+          </button>
+          <Link href="/#recent-live" className="rounded-lg border border-line px-4 py-2 text-sm font-medium text-slate-200 transition hover:border-mint/40 hover:text-mint">
+            Recent results
+          </Link>
+          <Link href="/" className="rounded-lg px-4 py-2 text-sm font-medium text-slate-300 underline-offset-2 transition hover:text-mint hover:underline">
+            Describe your startup
+          </Link>
+        </div>
       </div>
     );
   }

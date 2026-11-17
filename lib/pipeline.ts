@@ -23,9 +23,85 @@ import {
   tinysetCreate, tinysetGet, tinysetRows, type TinySetSpec,
 } from "./tinyfish";
 import { compFromTinySetRow, extractComps, keywordsOf, rankInvestors } from "./extract";
-import { getPreset } from "./presets";
+import { getPreset, type Preset } from "./presets";
+import { DAILY_LIVE_CAP, simulateQuota } from "./quota";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * TinySet rows requested per live run. The brief's minimum is 10 comparable
+ * companies, and rows are the wallet's known cost driver ($0.10/row), so
+ * Radar requests 10 (≈ $1.00 of dataset cost per run) and lets the
+ * Search/Fetch top-up path push the verified set past 10 when it can.
+ */
+export const TINYSET_TARGET_ROWS = 10;
+
+/** True when an error is TinyFish saying the wallet cannot pay (HTTP 402 / INSUFFICIENT_CREDITS / quota). */
+export function isCreditsError(e: unknown): boolean {
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
+  return msg.includes("402") || msg.includes("insufficient") || msg.includes("quota");
+}
+
+/** Keyword-match a founder description to the closest demo preset, if any. */
+export function closestPresetFor(input: FounderInput): Preset | null {
+  const text = `${input.description} ${input.sector ?? ""}`.toLowerCase();
+  if (/skin|beauty|d2c|cosmetic|brand/.test(text)) return getPreset("india-d2c-skincare");
+  if (/code|developer|devtool|pull request|software engineer/.test(text)) return getPreset("us-ai-devtool");
+  if (/fintech|payment|upi|bank|finance|smb|small business/.test(text)) return getPreset("indian-fintech");
+  return null;
+}
+
+/**
+ * Graceful quota fallback — the wallet-protection promise: a visitor NEVER
+ * sees an error page because live search is resting. Returns the closest
+ * worked example (a demo preset), flagged notice: "live-quota", with the
+ * honest steps that ran before the switch preserved in front of the log.
+ */
+export function quotaFallbackResult(
+  input: FounderInput,
+  priorSteps: PipelineStep[],
+  reason: "daily-cap" | "credits",
+  reasonDetail?: string
+): MatchResult {
+  const preset =
+    closestPresetFor(input) ??
+    getPreset(input.country === "India" ? "indian-fintech" : "us-ai-devtool")!;
+  const r = structuredClone(preset.result);
+  r.input = input;
+  r.notice = "live-quota";
+
+  const switchStep: PipelineStep =
+    reason === "daily-cap"
+      ? {
+          id: "quota-fallback",
+          label: "Live search paused — today's live-search budget is used up",
+          detail: `Radar caps live searches at ${DAILY_LIVE_CAP} per day to protect the TinyFish wallet (each live run builds a ${TINYSET_TARGET_ROWS}-row TinySet dataset ≈ $1.00, plus Search/Fetch calls). No credits were spent on this request.`,
+          status: "skipped",
+          ms: 0,
+        }
+      : {
+          id: "quota-fallback",
+          label: "Live search paused — TinyFish credits ran out mid-run",
+          detail: `TinyFish reported insufficient credits${reasonDetail ? ` (${reasonDetail})` : ""}. Radar stopped spending immediately — nothing further was charged for this request — and switched to a worked example.`,
+          status: "skipped",
+          ms: 0,
+        };
+  const exampleStep: PipelineStep = {
+    id: "quota-example",
+    label: `Worked example shown — “${preset.label}”`,
+    detail: "This is one of Radar's three fully worked sample results, chosen as the closest match to your description and labelled as a sample everywhere it appears. Everything else on the site — exports, saved investors, methodology — works as normal.",
+    status: "done",
+    ms: 0,
+  };
+  r.steps = [...priorSteps, switchStep, exampleStep, ...r.steps];
+  r.caveats = [
+    reason === "daily-cap"
+      ? "Live search is resting: today's live-search budget is used up so the wallet stays safe. The result below is a worked example, not a live run for your exact description — live searches reset at midnight UTC."
+      : "Live search stopped part-way: the TinyFish wallet ran out of credits during this run. The result below is a worked example, not a live run for your exact description.",
+    ...r.caveats,
+  ];
+  return r;
+}
 
 function tinysetSpecFor(input: FounderInput): TinySetSpec {
   const win = windowStart();
@@ -74,16 +150,23 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
     };
   }
 
+  // Test hook only (lib/quota.ts): simulate a wallet that cannot pay, to
+  // verify the graceful fallback without spending real credits.
+  if (simulateQuota() === "credits") {
+    step({ id: "tinyset-create", label: "TinySet — dataset build", detail: "Simulated failure (test hook FUNDING_RADAR_SIMULATE_QUOTA=credits): TinySet INSUFFICIENT_CREDITS — the wallet cannot cover the dataset rows.", status: "failed", ms: 0, endpoint: "TinySet" });
+    return quotaFallbackResult(input, steps, "credits", "simulated 402 INSUFFICIENT_CREDITS");
+  }
+
   // ---- 1. TinySet: build the comparable-companies dataset ----
   let tinysetComps: ComparableCompany[] = [];
   let datasetId: string | null = null;
   let tinysetNote = "";
   const tTs = Date.now();
   try {
-    const ds = await tinysetCreate(tinysetSpecFor(input), 15);
+    const ds = await tinysetCreate(tinysetSpecFor(input), TINYSET_TARGET_ROWS);
     datasetId = ds.id || null;
     if (!datasetId) throw new Error("TinySet returned no dataset id");
-    step({ id: "tinyset-create", label: "TinySet — dataset created, agents building it", detail: `Dataset ${datasetId} created with Radar's 8-column spec (company, what it does, country, round, amount, date, investors, source URL). Target: 15 companies that raised since ${win.label}.`, status: "done", ms: Date.now() - tTs, endpoint: "TinySet" });
+    step({ id: "tinyset-create", label: "TinySet — dataset created, agents building it", detail: `Dataset ${datasetId} created with Radar's 8-column spec (company, what it does, country, round, amount, date, investors, source URL). Target: ${TINYSET_TARGET_ROWS} companies that raised since ${win.label}.`, status: "done", ms: Date.now() - tTs, endpoint: "TinySet" });
 
     // Poll briefly — rows stream in; use what has landed.
     const deadline = Date.now() + 75_000;
@@ -104,6 +187,13 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
       : `TinySet dataset ${datasetId} was created but no rows had landed inside Radar's 75-second window (typical builds take 5-20 minutes). Radar topped up with Search + Fetch below; the dataset id is recorded so the run is verifiable in the TinyFish dashboard.`;
     step({ id: "tinyset-rows", label: "TinySet — rows read back", detail: tinysetNote, status: mapped.length > 0 ? "done" : "skipped", ms: Date.now() - tTs, endpoint: "TinySet" });
   } catch (e) {
+    if (isCreditsError(e)) {
+      // Wallet cannot pay for the dataset — stop spending NOW (Search/Fetch
+      // would only fail the same way) and serve the graceful fallback with
+      // the honest steps that ran so far.
+      step({ id: "tinyset-create", label: "TinySet — dataset build", detail: `TinySet could not start: ${e instanceof Error ? e.message : "credits error"}. Remaining live steps skipped to protect the wallet.`, status: "failed", ms: Date.now() - tTs, endpoint: "TinySet" });
+      return quotaFallbackResult(input, steps, "credits", e instanceof Error ? e.message : undefined);
+    }
     tinysetNote = `TinySet dataset creation failed (${e instanceof Error ? e.message : "unknown error"}). Radar continued with Search + Fetch + Agent, which build the same dataset shape from live sources.`;
     step({ id: "tinyset-create", label: "TinySet — dataset build", detail: tinysetNote, status: "failed", ms: Date.now() - tTs, endpoint: "TinySet" });
   }
@@ -122,6 +212,11 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
       step({ id: `search-${i + 1}`, label: `TinyFish Search — "${queries[i]}"`, detail: `${rows.length} results, ${added} new`, status: "done", ms: Date.now() - t0, endpoint: "Search" });
     } catch (e) {
       step({ id: `search-${i + 1}`, label: `TinyFish Search — "${queries[i]}"`, detail: `Failed: ${e instanceof Error ? e.message : "unknown error"}`, status: "failed", ms: Date.now() - t0, endpoint: "Search" });
+      if (isCreditsError(e)) {
+        // Credits ran out mid-pipeline: steps above already spent what they
+        // spent; stop here and serve the complete-looking fallback.
+        return quotaFallbackResult(input, steps, "credits", e instanceof Error ? e.message : undefined);
+      }
     }
   }
 
@@ -134,6 +229,11 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
     step({ id: "fetch", label: "TinyFish Fetch — articles read in full", detail: `Fetched ${fetchedPages.length} of ${fetchTargets.length} pages (${fetchTargets.map(hostOf).join(", ")})`, status: fetchedPages.length ? "done" : "failed", ms: Date.now() - tF, endpoint: "Fetch" });
   } catch (e) {
     step({ id: "fetch", label: "TinyFish Fetch — articles read in full", detail: `Fetch failed (${e instanceof Error ? e.message : "unknown error"}); continuing with snippets.`, status: "failed", ms: Date.now() - tF, endpoint: "Fetch" });
+    if (isCreditsError(e)) {
+      // Credits ran out at the Fetch stage — earlier steps already spent
+      // what they spent; serve the complete-looking fallback from here.
+      return quotaFallbackResult(input, steps, "credits", e instanceof Error ? e.message : undefined);
+    }
   }
 
   // ---- Merge comps: TinySet rows first (they carry dataset provenance), then Search/Fetch extraction ----
@@ -194,12 +294,7 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
 export function demoResultFor(input: FounderInput): MatchResult {
   // In demo mode, an exact-ish match to a preset's sector returns that preset
   // so the judge can still see a full result; otherwise an honest demo state.
-  const text = `${input.description} ${input.sector ?? ""}`.toLowerCase();
-  const preset =
-    /skin|beauty|d2c|cosmetic|brand/.test(text) ? getPreset("india-d2c-skincare")
-    : /code|developer|devtool|pull request|software engineer/.test(text) ? getPreset("us-ai-devtool")
-    : /fintech|payment|upi|bank|finance|smb|small business/.test(text) ? getPreset("indian-fintech")
-    : null;
+  const preset = closestPresetFor(input);
   if (preset) {
     const r = structuredClone(preset.result);
     r.input = input;

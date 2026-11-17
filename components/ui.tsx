@@ -15,7 +15,7 @@ export function RadarMark({ size = 30 }: { size?: number }) {
 export function Nav() {
   return (
     <header className="no-print sticky top-0 z-40 border-b border-line/70 bg-ink/85 backdrop-blur">
-      <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">
+      <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-3 sm:px-6">
         <Link href="/" className="flex items-center gap-2.5" aria-label="Funding Radar home">
           <RadarMark />
           <span className="text-[17px] font-semibold tracking-tight text-white">
@@ -35,7 +35,7 @@ export function Nav() {
 export function Footer() {
   return (
     <footer className="no-print border-t border-line/70 py-8">
-      <div className="mx-auto flex max-w-6xl flex-col gap-2 px-4 text-[13px] text-slate-500 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+      <div className="mx-auto flex max-w-6xl flex-col gap-2 px-3 text-[13px] text-slate-500 sm:flex-row sm:items-center sm:justify-between sm:px-6">
         <p>Funding Radar — find the investors who already back companies like yours. Every match carries its proof.</p>
         <p>
           Powered by{" "}
@@ -46,6 +46,19 @@ export function Footer() {
         </p>
       </div>
     </footer>
+  );
+}
+
+export function QuotaBanner() {
+  return (
+    <div className="no-print rounded-xl border border-sky2/40 bg-sky2/10 px-4 py-3 text-[13px] leading-relaxed text-sky-100" role="status">
+      <strong className="font-semibold text-sky2">Live search is resting.</strong>{" "}
+      Today's live-search budget is used up, so the wallet behind this site stays safe — a drained wallet
+      would look like a broken site, and it isn't. Radar caps live runs per day and serves repeats from
+      cache for free. Below is a full worked example instead; everything else on this site — exports,
+      saved investors, methodology — works as normal. Live searches reset at midnight UTC.{" "}
+      <Link href="/methodology" className="font-medium text-sky2 underline underline-offset-2">How the budget works</Link>
+    </div>
   );
 }
 

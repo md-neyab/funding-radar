@@ -36,9 +36,10 @@ With `TINYFISH_API_KEY` set, every description is researched live. The key is on
    in the last 18 months). TinySet's agents build the dataset from the live web; rows stream in, Radar
    polls and reads them back via `GET /v1/datasets/{id}/rows`, and the dataset ID is recorded in the
    result (verifiable in the TinyFish dashboard). **Rows without a source URL are dropped — no proof, no match.**
-   A TinySet build costs $0.10/row from the TinyFish wallet and typically takes 5–20 minutes; Radar uses
-   the rows that have landed inside a bounded window and is explicit when a build is still running or
-   failed — it never fakes a TinySet run.
+   A TinySet build costs $0.10/row from the TinyFish wallet and typically takes 5–20 minutes; Radar
+   requests **10 rows per search (≈ $1.00 of dataset cost per live run** — the brief's 10-comparable
+   minimum), tops the set up with Search/Fetch, uses the rows that have landed inside a bounded
+   window, and is explicit when a build is still running or failed — it never fakes a TinySet run.
 2. **TinyFish Search** (`GET api.search.tinyfish.ai`) — four query angles derived from the description
    (recent raises by similar companies, early rounds with named investors, "startups like…" coverage,
    funded-company lists), plus research on each candidate investor.
@@ -53,17 +54,48 @@ With `TINYFISH_API_KEY` set, every description is researched live. The key is on
 
 Four TinyFish endpoints, each doing a job it is actually needed for.
 
+## Wallet protection
+
+Radar runs on a small prepaid TinyFish wallet, on a public site anyone can use. Four layers keep
+that wallet safe — and keep the site from ever *looking* broken because of money:
+
+1. **Cheaper runs** — the TinySet dataset requests 10 rows (the brief's minimum), ≈ **$1.00** of
+   dataset cost per live run; Search/Fetch top the verified set up from there.
+2. **Daily cap** — at most **8 live searches per UTC day** (server-side, in `lib/quota.ts`). The
+   slot is reserved *before* a run starts, so slow, failed or parallel runs all count. On
+   serverless hosting the counter is per-instance and best-effort (a cold start resets it) —
+   combined with the cache and the credits fallback below, that is an accepted, documented
+   trade-off. `GET /api/match` reports today's budget (`liveBudget`) when a key is configured.
+3. **Result cache** — repeating the same (normalized) description + stage + country + sector is
+   served from the in-memory cache with a pipeline-log step *"Served from cache — no TinyFish
+   credits spent"*, and never counts against the cap. Completed live searches are listed on the
+   homepage under **"Recent live searches — free to re-open"** (backed by `GET /api/recent`),
+   so judges and founders can re-open real live results for free.
+4. **Graceful fallback, never an error page** — when the daily cap is reached, *or* TinyFish
+   returns a credits error (HTTP 402 / `INSUFFICIENT_CREDITS`) at any pipeline stage, Radar stops
+   spending immediately and returns the closest worked example flagged `notice: "live-quota"`.
+   The results page shows a friendly "Live search is resting" banner, the honest steps that ran
+   (and what they spent) stay in the pipeline log, and the example is labelled as a sample
+   everywhere. An empty wallet produces a calm explanation — never a broken-looking site.
+
+**Test hooks (local verification only).** With `FUNDING_RADAR_ENABLE_TEST_HOOKS=1` set,
+`FUNDING_RADAR_SIMULATE_QUOTA=cap` makes the daily cap behave as reached, and
+`FUNDING_RADAR_SIMULATE_QUOTA=credits` makes a live run fail as if TinyFish returned
+402 INSUFFICIENT_CREDITS — so the fallback can be verified without spending real credits.
+The hooks are inert unless the enable flag is set; **never set either variable in production.**
+
 ## API & exports (output reusable by other tools)
 
 - `POST /api/match` — body `{ description, stage, country, sector? }` (or `{ presetId }`) → the full
   structured result as JSON: comparables, ranked investors, sources, pipeline steps, TinySet provenance.
 - `GET /api/match?preset=indian-fintech` — a complete sample result as JSON.
-- `GET /api/match` — mode + preset catalogue.
+- `GET /api/match` — mode + preset catalogue (+ today's live-search budget in live mode).
+- `GET /api/recent` — the last live searches (summaries only); re-opening one via `POST /api/match` is a free cache hit.
 - Results page exports: **JSON**, **Investors CSV**, **Companies CSV**, copy-summary, print/PDF view.
 
 ## Pages
 
-- `/` — founder form (description, stage, country, sector), 3 one-click demo presets, how it works, recent searches
+- `/` — founder form (description, stage, country, sector), 3 one-click demo presets, "Recent live searches" (server-side, free to re-open), how it works, per-browser recent searches
 - `/results` — ranked investor list, comparable-companies table (expandable rows), TinySet/how-built panel, pipeline log, exports
 - `/watchlist` — saved investors + recent searches (localStorage, no account)
 - `/methodology` — TinySet's role, the ranking formula, and the tool's honest limitations

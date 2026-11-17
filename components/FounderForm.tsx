@@ -203,7 +203,22 @@ export default function FounderForm() {
 
       {phase === "error" && (
         <div className="mx-auto mt-8 max-w-2xl rounded-xl border border-rose2/40 bg-rose2/10 px-4 py-3 text-left text-sm leading-relaxed text-rose-100" role="alert">
-          {error}
+          <p>{error}</p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => runPreset("indian-fintech")}
+              className="rounded-lg bg-mint px-4 py-2 text-sm font-semibold text-ink transition hover:bg-emerald-300"
+            >
+              See a demo result
+            </button>
+            <a
+              href="#recent-live"
+              className="rounded-lg border border-rose2/40 px-4 py-2 text-sm font-medium text-rose-100 transition hover:border-mint/40 hover:text-mint"
+            >
+              Recent results
+            </a>
+          </div>
         </div>
       )}
     </div>

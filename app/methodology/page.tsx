@@ -46,9 +46,27 @@ export default function MethodologyPage() {
         </p>
         <p>
           Because founders will not wait 20 minutes, Search and Fetch (below) run in parallel and top the
-          dataset up. If a TinySet build fails — for example the account wallet cannot cover the rows at
-          $0.10/row — the pipeline log says so plainly and the Search/Fetch path builds the same dataset
-          shape on its own. Radar never pretends a TinySet run happened when it did not.
+          dataset up. Radar requests 10 rows per dataset — the brief's 10-comparable minimum — so the
+          dataset cost of a live run is about $1.00 at $0.10/row. If a TinySet build fails for a
+          non-credits reason, the pipeline log says so plainly and the Search/Fetch path builds the same
+          dataset shape on its own. Radar never pretends a TinySet run happened when it did not.
+        </p>
+      </Section>
+
+      <Section title="Wallet protection — why live search sometimes rests">
+        <p>
+          This site runs on a small prepaid TinyFish wallet, and anyone can use it — so live search is
+          guarded, by design:
+        </p>
+        <ul className="list-disc space-y-2 pl-5">
+          <li><strong className="text-white">A daily budget.</strong> At most 8 live searches run per day (UTC). The slot is reserved before a run starts, so retries and parallel runs count too.</li>
+          <li><strong className="text-white">Repeats are free.</strong> Running the same search again is served from a server-side cache — the pipeline log shows “Served from cache — no TinyFish credits spent” — and never counts against the budget. Completed live searches are listed on the home page as “Recent live searches”, free for anyone to re-open.</li>
+          <li><strong className="text-white">An empty wallet is not an error page.</strong> When the day's budget is used up, or TinyFish reports insufficient credits at any stage, Radar stops spending immediately and shows the closest fully worked example under a “Live search is resting” banner — with the honest steps that ran still in the pipeline log. The example is labelled as a sample everywhere, and everything else on the site keeps working.</li>
+        </ul>
+        <p>
+          The daily counter and cache live in server memory, so on serverless hosting they are
+          per-instance and best-effort; the credits-error fallback is the hard backstop, because it
+          reacts to TinyFish itself saying the wallet cannot pay.
         </p>
       </Section>
 
