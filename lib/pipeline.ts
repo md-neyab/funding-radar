@@ -52,34 +52,85 @@ export const TINYSET_POLL_INTERVAL_MS = 10_000;
 const RUN_POLL_DEADLINE_MS = 225_000;
 const RUN_SOFT_BUDGET_MS = 285_000;
 
+/** Terminal dataset statuses per the TinySet reference: the last run has ended. */
+const TINYSET_TERMINAL = new Set(["ready", "failed", "cancelled"]);
+
+export interface TinysetPollOutcome {
+  rows: Record<string, unknown>[];
+  /** Raw dataset status string from the last successful GET ("" if none). */
+  status: string;
+  /** Raw run status string (queued/running/done/failed/cancelled), if reported. */
+  runStatus: string | null;
+  /** The run's own error text when it failed (docs: run.error), if reported. */
+  runError: string | null;
+  /** row_count as reported by the last successful GET. */
+  rowCount: number;
+  /** True when a terminal status was actually observed (vs the deadline expiring). */
+  terminal: boolean;
+  /** Number of poll ticks attempted. */
+  polls: number;
+  /** Last poll/read error message, if any tick failed. */
+  lastError: string | null;
+}
+
 /**
- * Poll a TinySet dataset until rows land, the run reports ready/failed, or
- * the deadline passes. Transient poll errors are ignored (the next tick
- * retries); the most complete row set read is returned.
+ * Poll a TinySet dataset until rows land, the run reaches a terminal status
+ * (ready/failed/cancelled), or the deadline passes. Transient poll errors are
+ * noted and polling continues; the most complete row set read is returned.
+ *
+ * Diagnosis pass (pass 7): the outcome carries the RAW status strings,
+ * row_count and run.error so the step log shows what TinySet actually said.
+ * Two blind spots from earlier passes are closed here: rows are re-read one
+ * final time at the end regardless of what row_count claimed (the counter
+ * can lag the rows endpoint), and `cancelled` counts as terminal.
  */
-async function pollTinysetRows(
-  datasetId: string,
-  deadline: number
-): Promise<{ rows: Record<string, unknown>[]; status: string }> {
+async function pollTinysetRows(datasetId: string, deadline: number): Promise<TinysetPollOutcome> {
   let rows: Record<string, unknown>[] = [];
   let status = "";
+  let runStatus: string | null = null;
+  let runError: string | null = null;
+  let rowCount = 0;
+  let terminal = false;
+  let polls = 0;
+  let lastError: string | null = null;
+
+  const readRows = async () => {
+    const fetched = await tinysetRows(datasetId, 100);
+    if (fetched.length >= rows.length) rows = fetched;
+  };
+
   while (Date.now() < deadline) {
     await sleep(TINYSET_POLL_INTERVAL_MS);
     if (Date.now() >= deadline) break;
+    polls++;
     try {
       const st = await tinysetGet(datasetId);
       status = st.status;
-      if (st.rowCount > 0) {
-        const fetched = await tinysetRows(datasetId, 100);
-        if (fetched.length >= rows.length) rows = fetched;
-        if (rows.length >= TINYSET_TARGET_ROWS || status === "ready") break;
+      runStatus = st.runStatus;
+      runError = st.runError;
+      rowCount = st.rowCount;
+      lastError = null;
+      if (st.rowCount > 0) await readRows();
+      if (TINYSET_TERMINAL.has(status)) {
+        terminal = true;
+        break;
       }
-      if (status === "ready" || status === "failed") break;
-    } catch {
+      if (rows.length >= TINYSET_TARGET_ROWS) break;
+    } catch (e) {
       // Transient error reading the dataset — keep polling until the deadline.
+      lastError = e instanceof Error ? e.message : String(e);
     }
   }
-  return { rows, status };
+
+  // Final rows read, whatever row_count last claimed: if the run ended (or
+  // the window closed) with rows sitting in the dataset, this finds them.
+  try {
+    await readRows();
+  } catch (e) {
+    if (!lastError) lastError = e instanceof Error ? e.message : String(e);
+  }
+
+  return { rows, status, runStatus, runError, rowCount, terminal, polls, lastError };
 }
 
 /** True when an error is TinyFish saying the wallet cannot pay (HTTP 402 / INSUFFICIENT_CREDITS / quota). */
@@ -232,7 +283,7 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
   // dataset window costs no extra wall-clock. It never rejects — poll errors
   // are absorbed inside pollTinysetRows — so abandoning it on a mid-Search
   // credits fallback is safe.
-  const pollPromise: Promise<{ rows: Record<string, unknown>[]; status: string }> | null =
+  const pollPromise: Promise<TinysetPollOutcome> | null =
     datasetId
       ? pollTinysetRows(
           datasetId,
@@ -269,13 +320,68 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
 
   // ---- 1b. TinySet rows: collect whatever the concurrent poll landed ----
   if (pollPromise && datasetId) {
-    const { rows } = await pollPromise;
-    const mapped = rows.map(compFromTinySetRow).filter((c): c is ComparableCompany => c !== null);
+    const poll = await pollPromise;
+    const rows = poll.rows;
+    // Account for every row read: used, or dropped by the mapping — and why.
+    // A comparable only counts with a company name AND a source URL (proof).
+    let droppedNoName = 0;
+    let droppedNoSource = 0;
+    const mapped: ComparableCompany[] = [];
+    for (const row of rows) {
+      const c = compFromTinySetRow(row);
+      if (c) {
+        mapped.push(c);
+      } else if (!String(row.company ?? "").trim()) {
+        droppedNoName++;
+      } else {
+        droppedNoSource++;
+      }
+    }
     tinysetComps = mapped;
-    tinysetNote = mapped.length > 0
-      ? `TinySet dataset ${datasetId} contributed ${mapped.length} comparable companies with source URLs. The dataset keeps building in the background (TinySet runs typically take 5-20 minutes) — re-run later for a fuller set.`
-      : `TinySet dataset ${datasetId} was created but no rows had landed inside Radar's polling window (up to ~4 minutes; typical builds take 5-20 minutes). Radar topped up with Search + Fetch below; the dataset id is recorded so the run is verifiable in the TinyFish dashboard.`;
-    step({ id: "tinyset-rows", label: "TinySet — rows read back", detail: tinysetNote, status: mapped.length > 0 ? "done" : "skipped", ms: Date.now() - tTs, endpoint: "TinySet" });
+
+    // Raw diagnostics, straight from the TinySet payloads (no secrets in
+    // them): this is the line that tells the truth about an empty dataset.
+    const firstRowKeys = rows.length > 0 ? Object.keys(rows[0]).slice(0, 12).join(", ") : "—";
+    const diag =
+      `Raw TinySet state — dataset status "${poll.status || "unknown"}", run status "${poll.runStatus ?? "not reported"}", ` +
+      `row_count ${poll.rowCount}, rows endpoint returned ${rows.length}, rows used ${mapped.length}` +
+      (droppedNoName + droppedNoSource > 0
+        ? `, rows dropped ${droppedNoName + droppedNoSource} (no company name: ${droppedNoName}, no source_url: ${droppedNoSource})`
+        : "") +
+      (rows.length > 0 ? `, first row keys: ${firstRowKeys}` : "") +
+      (poll.runError ? `. Run error reported by TinySet: ${poll.runError}` : "") +
+      (poll.lastError ? `. Last poll error: ${poll.lastError}` : "") +
+      `. Polls: ${poll.polls}, ended on ${poll.terminal ? "a terminal status" : "the polling deadline"}.`;
+
+    if (mapped.length > 0) {
+      tinysetNote =
+        `TinySet dataset ${datasetId} contributed ${mapped.length} comparable companies with source URLs. ` +
+        (poll.terminal
+          ? "The TinySet run has finished; this is its final set for this search."
+          : "The dataset may still be building in the background (TinySet runs typically take 5-20 minutes) — re-run later for a fuller set.");
+    } else if (rows.length > 0) {
+      tinysetNote =
+        `TinySet dataset ${datasetId} returned ${rows.length} row(s), but none could be used: every row was missing a company name or the source URL Radar requires as proof. ` +
+        `Radar topped up with Search + Fetch below; the dataset id is recorded so the rows are verifiable in the TinyFish dashboard.`;
+    } else if (poll.terminal) {
+      tinysetNote =
+        `TinySet dataset ${datasetId} — the run ENDED (dataset status "${poll.status}"${poll.runStatus ? `, run "${poll.runStatus}"` : ""}) with 0 rows. ` +
+        `This is not a polling-window problem: the run is over and the dataset is empty.` +
+        (poll.runError ? ` TinySet reported this run error: ${poll.runError}.` : " TinySet reported no run error.") +
+        ` Radar topped up with Search + Fetch below; the dataset id is recorded so the run is verifiable in the TinyFish dashboard.`;
+    } else {
+      tinysetNote =
+        `TinySet dataset ${datasetId} was created but no rows had landed inside Radar's polling window (up to ~4 minutes; typical builds take 5-20 minutes) and the run was still in progress when the window closed. ` +
+        `Radar topped up with Search + Fetch below; the dataset id is recorded so the run is verifiable in the TinyFish dashboard.`;
+    }
+    step({
+      id: "tinyset-rows",
+      label: "TinySet — rows read back",
+      detail: `${tinysetNote} ${diag}`,
+      status: mapped.length > 0 ? "done" : "skipped",
+      ms: Date.now() - tTs,
+      endpoint: "TinySet",
+    });
   }
   steps.push(...searchSteps);
 

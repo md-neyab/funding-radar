@@ -137,8 +137,12 @@ export async function tfAgentVerify(profileUrl: string, company: string, timeout
 // TinySet (Datasets API) — https://docs.tinyfish.ai/datasets/reference
 // Base: https://agent.tinyfish.ai, same X-API-Key header.
 //   POST /v1/datasets            { prompt | spec, target_rows, populate } -> dataset (202 when a run starts)
-//   GET  /v1/datasets/{id}       -> { id, status, row_count, run: { id, status } }
+//   GET  /v1/datasets/{id}       -> { id, status, row_count, run: { id, status, error? } }
 //   GET  /v1/datasets/{id}/rows  -> { data: [ { <column>: value, ... } ], truncated, next_cursor }
+// Dataset status: empty | populating | ready | failed | cancelled.
+// Run status: queued | running | done | failed | cancelled. Per the docs
+// guide, "a failed run explains why in run.error" — so the client surfaces
+// run.error verbatim (truncated) instead of discarding it.
 // A populate run typically takes 5-20 minutes and costs $0.10 per row from
 // the wallet. Rows stream in, so partial rows can be read while it runs.
 // ---------------------------------------------------------------------------
@@ -162,6 +166,27 @@ export interface TinySetDataset {
   status: string;
   rowCount: number;
   runStatus: string | null;
+  runId: string | null;
+  /** The run's own error text when it failed (docs: run.error). Truncated. */
+  runError: string | null;
+}
+
+function parseDataset(data: any, fallbackId = ""): TinySetDataset {
+  const d = data?.dataset ?? data ?? {};
+  const run = d?.run ?? null;
+  let runError: string | null = null;
+  if (run?.error != null) {
+    runError = typeof run.error === "string" ? run.error : JSON.stringify(run.error);
+    if (runError && runError.length > 300) runError = runError.slice(0, 300) + "…";
+  }
+  return {
+    id: String(d?.id ?? fallbackId),
+    status: String(d?.status ?? ""),
+    rowCount: Number(d?.row_count ?? 0),
+    runStatus: run?.status ? String(run.status) : null,
+    runId: run?.id ? String(run.id) : null,
+    runError,
+  };
 }
 
 async function tfJson(url: string, init: RequestInit, timeoutMs: number): Promise<any> {
@@ -191,30 +216,32 @@ export async function tinysetCreate(spec: TinySetSpec, targetRows: number): Prom
     { method: "POST", body: JSON.stringify({ spec, target_rows: targetRows, populate: true }) },
     30000
   );
-  const d = data?.dataset ?? data;
-  return {
-    id: String(d?.id ?? ""),
-    status: String(d?.status ?? "populating"),
-    rowCount: Number(d?.row_count ?? 0),
-    runStatus: d?.run?.status ? String(d.run.status) : null,
-  };
+  const ds = parseDataset(data);
+  if (!ds.status) ds.status = "populating";
+  return ds;
 }
 
 export async function tinysetGet(id: string): Promise<TinySetDataset> {
   const data = await tfJson(`${DATASETS_URL}/${id}`, { method: "GET" }, 15000);
-  const d = data?.dataset ?? data;
-  return {
-    id: String(d?.id ?? id),
-    status: String(d?.status ?? ""),
-    rowCount: Number(d?.row_count ?? 0),
-    runStatus: d?.run?.status ? String(d.run.status) : null,
-  };
+  return parseDataset(data, id);
 }
 
 export async function tinysetRows(id: string, limit = 100): Promise<Record<string, unknown>[]> {
   const data = await tfJson(`${DATASETS_URL}/${id}/rows?limit=${limit}`, { method: "GET" }, 20000);
   const rows: any[] = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
-  return rows as Record<string, unknown>[];
+  return rows.map((r) => {
+    // Rows are documented as flat cell objects keyed by column name, but the
+    // run event stream describes a row as { row_id, data: { ...cells } }.
+    // Unwrap the wrapped shape if it ever shows up here so cell lookups by
+    // column name work either way.
+    if (r && typeof r === "object") {
+      const cells = (r as Record<string, unknown>).data;
+      if (cells && typeof cells === "object" && !Array.isArray(cells)) {
+        return cells as Record<string, unknown>;
+      }
+    }
+    return r as Record<string, unknown>;
+  });
 }
 
 export function hostOf(url: string): string {

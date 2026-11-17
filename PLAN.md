@@ -298,3 +298,62 @@ back to Search+Fetch top-up and returned only **4 comparable companies / 3 inves
 **Verification:** `npm run build` passes; one authorised live verification run against the
 production API after redeploy (new EdTech description, not a cache hit) — outcome recorded
 in the pass-6 report to Neyab.
+
+## TinySet diagnosis (pass 7 — 17 Nov 2026, after the second empty live run)
+
+**Problem (observed live, twice on 17 Nov):** live runs create the TinySet dataset and are
+charged for it (run 1: $0.80 of dataset cost), yet the dataset contributes **0 usable rows**.
+Run 1 (75s window): 0 rows inside the window, Search+Fetch fallback returned 4 comps.
+Run 2 (pass-6 ~240s window): dataset `df12c272-f634-4600-9093-3e41f6010014` reached a
+**terminal status at ~105s with rowsUsed 0**; the top-up then found only 1 comp / 0 investors
+(`no_matches`). The step log could not say WHICH terminal status, what `row_count` claimed,
+or whether rows existed but were dropped by the mapping — the evidence was discarded in code.
+
+**Docs audit (docs.tinyfish.ai, read in full 17 Nov; reference updated 2026-11-17):**
+- Endpoints, base URL and header match the client exactly: `POST /v1/datasets` (exactly one
+  of `prompt`|`spec`; `202` when a run starts), `GET /v1/datasets/{id}`, `GET .../rows`.
+- Dataset object: `status`, `row_count`, `run` — "`run` has `id`, `status`, `started_at`,
+  and, once it ends, `finished_at`. A failed run also has `error`." Dataset statuses:
+  `empty | populating | ready | failed | cancelled`; run statuses:
+  `queued | running | done | failed | cancelled`.
+- Guide: "check `GET /v1/datasets/{id}` until `status` is `ready`, `failed`, or
+  `cancelled`. **A failed run explains why in `run.error`.** Then page through
+  `GET /v1/datasets/{id}/rows`."
+- Rows: "`GET /v1/datasets/{id}/rows` returns one object per row, with cells keyed by
+  column `name`" (overview); the event stream describes a row as `{ row_id, data }`.
+- Spec rules all satisfied by Radar's spec: 1-10 columns incl. the key (we send 8),
+  exactly one primary key, allowed types, name ≤ 200 chars. Typical run 5-20 minutes;
+  $0.10 per row; 402 carries `max_affordable_rows`; datasets not enabled for an account
+  would 404 `FEATURE_NOT_AVAILABLE` at create (create succeeds, so it IS enabled).
+
+**Defects found in our code (lib/tinyfish.ts + lib/pipeline.ts):**
+1. **`run.error` was never read** — `TinySetDataset` didn't even carry it. If a run failed,
+   TinySet's own explanation was in the payload and we threw it away.
+2. **The poll's observed status was discarded** — `runMatch` destructured only `{ rows }`;
+   the tinyset-rows step never recorded dataset status, run status or `row_count`.
+3. **The step note conflated three different failures** — "no rows had landed" was printed
+   whenever *mapped* comps = 0, including "rows existed but every row was dropped for a
+   missing company/source_url".
+4. **Rows were only read while `row_count > 0`, and never re-read at terminal state** —
+   a lagging/absent counter would report an empty dataset forever.
+5. **`cancelled` was not treated as terminal** (docs list it as one).
+6. **Row-shape blind spot** — the mapper assumed flat cell objects; a wrapped
+   `{ id, data: { ...cells } }` row (the event-stream shape) would be dropped 100%
+   with no trace in the log.
+
+**Fixes (safeguards, fallbacks, cap, cache, demo mode all unchanged):**
+- Client: shared `parseDataset` now surfaces `runId` and `runError` (truncated to 300
+  chars); `tinysetRows` unwraps a `data`-wrapped row if one ever appears.
+- Poll: returns a full `TinysetPollOutcome` — raw dataset status, raw run status,
+  run.error, last `row_count`, polls count, last poll error, and whether a terminal
+  status was actually observed; `cancelled` is terminal; one final `/rows` read always
+  happens at the end regardless of `row_count`.
+- Step log: the tinyset-rows step now prints the raw diagnostics line (statuses,
+  row_count, rows-endpoint count, rows used, drop accounting — no company name vs
+  no source_url — and the first row's keys), and `tinyset.note` distinguishes
+  "run ENDED with 0 rows (not a timing problem)" from "still building when the
+  window closed" from "rows landed but were unusable".
+
+**Verification:** `npm run build` passes; one authorised live verification run against
+the production API after redeploy (fresh FoodTech description, not a cache hit) —
+outcome recorded in the pass-7 report to Neyab.
