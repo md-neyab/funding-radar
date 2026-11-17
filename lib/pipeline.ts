@@ -12,9 +12,10 @@
 //                  THIS founder's stage, sector and geography.
 //
 // TinySet runs typically take 5-20 minutes; rows stream in. Radar polls for
-// a bounded window and uses whatever rows have landed, topping up with
-// Search/Fetch comps so the founder is never left waiting. The result
-// records the TinySet dataset id either way — no fake integration.
+// up to ~4 minutes — while Search runs concurrently, so the dataset window
+// costs no extra wall-clock — and uses whatever rows have landed, topping
+// up with Search/Fetch comps so the founder is never left waiting. The
+// result records the TinySet dataset id either way — no fake integration.
 
 import type { ComparableCompany, FounderInput, MatchResult, PipelineStep } from "./types";
 import { windowStart } from "./types";
@@ -35,6 +36,51 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * Search/Fetch top-up path push the verified set past 10 when it can.
  */
 export const TINYSET_TARGET_ROWS = 10;
+
+/**
+ * TinySet polling (pass 6): the first live run created the dataset and was
+ * charged for it, but 0 rows landed inside the old 75-second polling window —
+ * real TinySet builds take minutes. Radar now polls for up to ~240s,
+ * checking every ~10s and stopping as soon as the target rows land, while
+ * the Search phase runs concurrently. Absolute deadlines keep the whole run
+ * inside the route's maxDuration (300s): polling stops by ~225s into the
+ * run, and Fetch/Agent receive whatever budget remains under a ~285s soft
+ * cap, so every existing fallback still fires in time.
+ */
+export const TINYSET_POLL_WINDOW_MS = 240_000;
+export const TINYSET_POLL_INTERVAL_MS = 10_000;
+const RUN_POLL_DEADLINE_MS = 225_000;
+const RUN_SOFT_BUDGET_MS = 285_000;
+
+/**
+ * Poll a TinySet dataset until rows land, the run reports ready/failed, or
+ * the deadline passes. Transient poll errors are ignored (the next tick
+ * retries); the most complete row set read is returned.
+ */
+async function pollTinysetRows(
+  datasetId: string,
+  deadline: number
+): Promise<{ rows: Record<string, unknown>[]; status: string }> {
+  let rows: Record<string, unknown>[] = [];
+  let status = "";
+  while (Date.now() < deadline) {
+    await sleep(TINYSET_POLL_INTERVAL_MS);
+    if (Date.now() >= deadline) break;
+    try {
+      const st = await tinysetGet(datasetId);
+      status = st.status;
+      if (st.rowCount > 0) {
+        const fetched = await tinysetRows(datasetId, 100);
+        if (fetched.length >= rows.length) rows = fetched;
+        if (rows.length >= TINYSET_TARGET_ROWS || status === "ready") break;
+      }
+      if (status === "ready" || status === "failed") break;
+    } catch {
+      // Transient error reading the dataset — keep polling until the deadline.
+    }
+  }
+  return { rows, status };
+}
 
 /** True when an error is TinyFish saying the wallet cannot pay (HTTP 402 / INSUFFICIENT_CREDITS / quota). */
 export function isCreditsError(e: unknown): boolean {
@@ -157,6 +203,8 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
     return quotaFallbackResult(input, steps, "credits", "simulated 402 INSUFFICIENT_CREDITS");
   }
 
+  const runStart = Date.now();
+
   // ---- 1. TinySet: build the comparable-companies dataset ----
   let tinysetComps: ComparableCompany[] = [];
   let datasetId: string | null = null;
@@ -167,25 +215,6 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
     datasetId = ds.id || null;
     if (!datasetId) throw new Error("TinySet returned no dataset id");
     step({ id: "tinyset-create", label: "TinySet — dataset created, agents building it", detail: `Dataset ${datasetId} created with Radar's 8-column spec (company, what it does, country, round, amount, date, investors, source URL). Target: ${TINYSET_TARGET_ROWS} companies that raised since ${win.label}.`, status: "done", ms: Date.now() - tTs, endpoint: "TinySet" });
-
-    // Poll briefly — rows stream in; use what has landed.
-    const deadline = Date.now() + 75_000;
-    let rows: Record<string, unknown>[] = [];
-    while (Date.now() < deadline) {
-      await sleep(12_000);
-      const status = await tinysetGet(datasetId);
-      if (status.rowCount > 0) {
-        rows = await tinysetRows(datasetId, 100);
-        if (rows.length >= 10 || status.status === "ready") break;
-      }
-      if (status.status === "ready" || status.status === "failed") break;
-    }
-    const mapped = rows.map(compFromTinySetRow).filter((c): c is ComparableCompany => c !== null);
-    tinysetComps = mapped;
-    tinysetNote = mapped.length > 0
-      ? `TinySet dataset ${datasetId} contributed ${mapped.length} comparable companies with source URLs. The dataset keeps building in the background (TinySet runs typically take 5-20 minutes) — re-run later for a fuller set.`
-      : `TinySet dataset ${datasetId} was created but no rows had landed inside Radar's 75-second window (typical builds take 5-20 minutes). Radar topped up with Search + Fetch below; the dataset id is recorded so the run is verifiable in the TinyFish dashboard.`;
-    step({ id: "tinyset-rows", label: "TinySet — rows read back", detail: tinysetNote, status: mapped.length > 0 ? "done" : "skipped", ms: Date.now() - tTs, endpoint: "TinySet" });
   } catch (e) {
     if (isCreditsError(e)) {
       // Wallet cannot pay for the dataset — stop spending NOW (Search/Fetch
@@ -198,9 +227,26 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
     step({ id: "tinyset-create", label: "TinySet — dataset build", detail: tinysetNote, status: "failed", ms: Date.now() - tTs, endpoint: "TinySet" });
   }
 
+  // Poll for TinySet rows CONCURRENTLY with the Search phase below (pass 6):
+  // the promise starts now and is awaited after Search, so the up-to-~4-minute
+  // dataset window costs no extra wall-clock. It never rejects — poll errors
+  // are absorbed inside pollTinysetRows — so abandoning it on a mid-Search
+  // credits fallback is safe.
+  const pollPromise: Promise<{ rows: Record<string, unknown>[]; status: string }> | null =
+    datasetId
+      ? pollTinysetRows(
+          datasetId,
+          Math.min(Date.now() + TINYSET_POLL_WINDOW_MS, runStart + RUN_POLL_DEADLINE_MS)
+        )
+      : null;
+
   // ---- 2. Search: funding announcements + investor research ----
+  // Steps are collected separately and appended after the TinySet rows step,
+  // keeping the log in pipeline order even though Search ran concurrently.
+  const searchSteps: PipelineStep[] = [];
+  const sstep = (s: PipelineStep) => searchSteps.push(s);
   const queries = searchQueriesFor(input);
-  step({ id: "plan", label: "Planned research queries", detail: queries.join("  ·  "), status: "done", ms: 2, endpoint: "Search" });
+  sstep({ id: "plan", label: "Planned research queries", detail: queries.join("  ·  "), status: "done", ms: 2, endpoint: "Search" });
   const allResults = [];
   const seen = new Set<string>();
   for (let i = 0; i < queries.length; i++) {
@@ -209,23 +255,39 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
       const rows = await tfSearch(queries[i]);
       let added = 0;
       for (const r of rows) if (!seen.has(r.url)) { seen.add(r.url); allResults.push(r); added++; }
-      step({ id: `search-${i + 1}`, label: `TinyFish Search — "${queries[i]}"`, detail: `${rows.length} results, ${added} new`, status: "done", ms: Date.now() - t0, endpoint: "Search" });
+      sstep({ id: `search-${i + 1}`, label: `TinyFish Search — "${queries[i]}"`, detail: `${rows.length} results, ${added} new`, status: "done", ms: Date.now() - t0, endpoint: "Search" });
     } catch (e) {
-      step({ id: `search-${i + 1}`, label: `TinyFish Search — "${queries[i]}"`, detail: `Failed: ${e instanceof Error ? e.message : "unknown error"}`, status: "failed", ms: Date.now() - t0, endpoint: "Search" });
+      sstep({ id: `search-${i + 1}`, label: `TinyFish Search — "${queries[i]}"`, detail: `Failed: ${e instanceof Error ? e.message : "unknown error"}`, status: "failed", ms: Date.now() - t0, endpoint: "Search" });
       if (isCreditsError(e)) {
         // Credits ran out mid-pipeline: steps above already spent what they
-        // spent; stop here and serve the complete-looking fallback.
-        return quotaFallbackResult(input, steps, "credits", e instanceof Error ? e.message : undefined);
+        // spent; stop here and serve the complete-looking fallback. The
+        // background poll is abandoned (it cannot reject).
+        return quotaFallbackResult(input, [...steps, ...searchSteps], "credits", e instanceof Error ? e.message : undefined);
       }
     }
   }
+
+  // ---- 1b. TinySet rows: collect whatever the concurrent poll landed ----
+  if (pollPromise && datasetId) {
+    const { rows } = await pollPromise;
+    const mapped = rows.map(compFromTinySetRow).filter((c): c is ComparableCompany => c !== null);
+    tinysetComps = mapped;
+    tinysetNote = mapped.length > 0
+      ? `TinySet dataset ${datasetId} contributed ${mapped.length} comparable companies with source URLs. The dataset keeps building in the background (TinySet runs typically take 5-20 minutes) — re-run later for a fuller set.`
+      : `TinySet dataset ${datasetId} was created but no rows had landed inside Radar's polling window (up to ~4 minutes; typical builds take 5-20 minutes). Radar topped up with Search + Fetch below; the dataset id is recorded so the run is verifiable in the TinyFish dashboard.`;
+    step({ id: "tinyset-rows", label: "TinySet — rows read back", detail: tinysetNote, status: mapped.length > 0 ? "done" : "skipped", ms: Date.now() - tTs, endpoint: "TinySet" });
+  }
+  steps.push(...searchSteps);
 
   // ---- 3. Fetch: read strongest sources in full ----
   const fetchTargets = allResults.slice(0, 6).map((r) => r.url);
   const tF = Date.now();
   let fetchedPages: Awaited<ReturnType<typeof tfFetch>> = [];
+  // Budget-aware timeout (pass 6): leave room for ranking + the Agent pass
+  // under the run's soft cap so the route always answers within maxDuration.
+  const fetchTimeoutMs = Math.max(10_000, Math.min(60_000, runStart + RUN_SOFT_BUDGET_MS - Date.now() - 30_000));
   try {
-    fetchedPages = await tfFetch(fetchTargets);
+    fetchedPages = await tfFetch(fetchTargets, fetchTimeoutMs);
     step({ id: "fetch", label: "TinyFish Fetch — articles read in full", detail: `Fetched ${fetchedPages.length} of ${fetchTargets.length} pages (${fetchTargets.map(hostOf).join(", ")})`, status: fetchedPages.length ? "done" : "failed", ms: Date.now() - tF, endpoint: "Fetch" });
   } catch (e) {
     step({ id: "fetch", label: "TinyFish Fetch — articles read in full", detail: `Fetch failed (${e instanceof Error ? e.message : "unknown error"}); continuing with snippets.`, status: "failed", ms: Date.now() - tF, endpoint: "Fetch" });
@@ -262,7 +324,8 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
     const siteGuess = allResults.find((r) => r.title.toLowerCase().includes(top.name.toLowerCase().split(" ")[0]));
     const tA = Date.now();
     if (siteGuess) {
-      const out = await tfAgentVerify(siteGuess.url, top.name);
+      const agentTimeoutMs = Math.max(8_000, Math.min(50_000, runStart + RUN_SOFT_BUDGET_MS - Date.now() - 5_000));
+      const out = await tfAgentVerify(siteGuess.url, top.name, agentTimeoutMs);
       if (out) {
         top.partnerNote = `Agent-verified on the investor's own pages: ${out.slice(0, 280)}`;
         top.contactUrl = siteGuess.url;

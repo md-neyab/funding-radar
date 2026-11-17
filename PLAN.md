@@ -267,3 +267,34 @@ desktop (≥768px) class value is unchanged; SSR render check confirms the compa
 4. **LinkedIn + X posts** — required fields on the claim form; copy should lead with the demo video
    story: describe startup → TinySet dataset builds → ranked investors with proof.
 5. **Deadline: 18 Nov 2026, 1:29 PM IST.** Claim already registered on Neyab's account.
+
+## TinySet polling fix (pass 6 — 17 Nov 2026, after the first real live run)
+
+**Problem (observed live, 17 Nov ~17:30 IST):** the first real live run (Recall-Notebook-style
+description) created the TinySet dataset and was charged for it ($0.80 of the run's $0.848
+total), but **0 rows landed inside the app's 75-second polling window**, so the pipeline fell
+back to Search+Fetch top-up and returned only **4 comparable companies / 3 investors**
+(#1 Accel, 62) — short of the brief's 10+ target. TinySet builds typically take 5–20 minutes;
+75s was simply too short.
+
+**Fix (lib/pipeline.ts only; route already exported `maxDuration = 300`):**
+1. **Polling window 75s → up to ~240s** — poll every ~10s (`TINYSET_POLL_INTERVAL_MS`),
+   stop early as soon as the target 10 rows have landed or the run reports ready.
+2. **Search runs concurrently** — the poll promise starts immediately after dataset
+   creation and is awaited after the Search phase, so the longer window costs no extra
+   wall-clock. Search steps are collected separately and appended after the TinySet rows
+   step, keeping the step log in pipeline order. A mid-Search credits error still returns
+   the graceful quota fallback at once (the background poll never rejects, so abandoning
+   it is safe).
+3. **Hard run budgets** — polling stops by ~225s into the run (`RUN_POLL_DEADLINE_MS`);
+   Fetch and Agent timeouts are computed from what remains under a ~285s soft cap
+   (`RUN_SOFT_BUDGET_MS`), so the whole run always answers within `maxDuration = 300`
+   with all fallbacks (Search+Fetch top-up, quota fallback, honest step log) intact.
+   Dataset rows, when they land, remain the primary comparables in the merge (TinySet
+   rows win over Search/Fetch extraction for the same company, as before).
+4. **Unchanged:** demo mode, presets, result cache, the 8/day live cap, the quota
+   fallback, and all UI. The 0-rows step note now honestly says "up to ~4 minutes".
+
+**Verification:** `npm run build` passes; one authorised live verification run against the
+production API after redeploy (new EdTech description, not a cache hit) — outcome recorded
+in the pass-6 report to Neyab.
