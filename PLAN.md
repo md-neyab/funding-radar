@@ -357,3 +357,35 @@ or whether rows existed but were dropped by the mapping — the evidence was dis
 **Verification:** `npm run build` passes; one authorised live verification run against
 the production API after redeploy (fresh FoodTech description, not a cache hit) —
 outcome recorded in the pass-7 report to Neyab.
+
+**Root cause — FOUND (pass 7 verification run + TinyFish's own SDK source).**
+The authorised verification run (fresh FoodTech/tiffin description, dataset
+`55210c23-c02a-433e-b536-c505731b1b9e`) came back with the new diagnostics line:
+dataset status `ready`, run `done`, **no run error, `row_count` 10 — and the rows
+endpoint returned 0**. The dataset was never empty; our rows READ was broken.
+TinyFish's published TypeScript SDK (@tiny-fish/sdk 0.11.0, `dist/datasets/types.js`)
+defines the real shapes:
+
+- `datasetRowsResponseSchema`: `{ columns, rows: [...], truncated, next_cursor }` —
+  the page array key is **`rows`**, not the `data` key the *list-datasets* endpoint uses.
+- `datasetRowSchema`: `{ _id, data: { <column>: value } }` — "One row: cells keyed by
+  column name", with the cells inside each row's **`data`** property (which is what the
+  docs prose "Cells in `data`" actually meant).
+
+Radar's `tinysetRows` read `response.data` as the row array → `[]` from every response,
+in every run. That one parse bug explains run 1 (billed $0.80 = 8 rows completed
+server-side; we could not have seen them at any window length) and run 2 (terminal at
+~105s, full set waiting unread). The pass-6 "window too short" theory was wrong.
+
+**Fix:** `tinysetRowsPage` now parses the real envelope (`rows` key, `data`-array and
+bare-array shapes still accepted defensively), unwraps each row's `data` cells, follows
+`next_cursor` while `truncated`, and reports the envelope's top-level keys into the
+step-log diagnostics line so any future shape drift is visible on the page itself.
+
+**Verification status (honest):** the one authorised live run was spent proving the
+diagnosis (row_count 10 vs 0 rows read — the smoking gun, now visible on the page's own
+step log). The retrieval fix is grounded in TinyFish's own SDK source, builds clean,
+and is pushed; it has NOT been re-run live (no second verification run, per the pass
+brief). Independent confirmation available without any run: dataset
+`55210c23-c02a-433e-b536-c505731b1b9e`'s 10 rows are sitting in Neyab's TinyFish
+dashboard. The next real live search exercises the fixed reader end to end.

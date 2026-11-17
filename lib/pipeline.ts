@@ -21,7 +21,7 @@ import type { ComparableCompany, FounderInput, MatchResult, PipelineStep } from 
 import { windowStart } from "./types";
 import {
   hasTinyFishKey, tfSearch, tfFetch, tfAgentVerify, hostOf,
-  tinysetCreate, tinysetGet, tinysetRows, type TinySetSpec,
+  tinysetCreate, tinysetGet, tinysetRowsPage, type TinySetSpec,
 } from "./tinyfish";
 import { compFromTinySetRow, extractComps, keywordsOf, rankInvestors } from "./extract";
 import { getPreset, type Preset } from "./presets";
@@ -71,6 +71,8 @@ export interface TinysetPollOutcome {
   polls: number;
   /** Last poll/read error message, if any tick failed. */
   lastError: string | null;
+  /** Top-level keys of the /rows response envelope, as last seen. */
+  rowsEnvelopeKeys: string[];
 }
 
 /**
@@ -93,10 +95,12 @@ async function pollTinysetRows(datasetId: string, deadline: number): Promise<Tin
   let terminal = false;
   let polls = 0;
   let lastError: string | null = null;
+  let rowsEnvelopeKeys: string[] = [];
 
   const readRows = async () => {
-    const fetched = await tinysetRows(datasetId, 100);
-    if (fetched.length >= rows.length) rows = fetched;
+    const page = await tinysetRowsPage(datasetId, 100);
+    if (page.envelopeKeys.length > 0) rowsEnvelopeKeys = page.envelopeKeys;
+    if (page.rows.length >= rows.length) rows = page.rows;
   };
 
   while (Date.now() < deadline) {
@@ -130,7 +134,7 @@ async function pollTinysetRows(datasetId: string, deadline: number): Promise<Tin
     if (!lastError) lastError = e instanceof Error ? e.message : String(e);
   }
 
-  return { rows, status, runStatus, runError, rowCount, terminal, polls, lastError };
+  return { rows, status, runStatus, runError, rowCount, terminal, polls, lastError, rowsEnvelopeKeys };
 }
 
 /** True when an error is TinyFish saying the wallet cannot pay (HTTP 402 / INSUFFICIENT_CREDITS / quota). */
@@ -351,6 +355,7 @@ export async function runMatch(input: FounderInput): Promise<MatchResult> {
       (rows.length > 0 ? `, first row keys: ${firstRowKeys}` : "") +
       (poll.runError ? `. Run error reported by TinySet: ${poll.runError}` : "") +
       (poll.lastError ? `. Last poll error: ${poll.lastError}` : "") +
+      (poll.rowsEnvelopeKeys.length > 0 ? `. Rows envelope keys: ${poll.rowsEnvelopeKeys.join(", ")}` : "") +
       `. Polls: ${poll.polls}, ended on ${poll.terminal ? "a terminal status" : "the polling deadline"}.`;
 
     if (mapped.length > 0) {

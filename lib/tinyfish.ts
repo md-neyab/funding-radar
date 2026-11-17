@@ -138,7 +138,7 @@ export async function tfAgentVerify(profileUrl: string, company: string, timeout
 // Base: https://agent.tinyfish.ai, same X-API-Key header.
 //   POST /v1/datasets            { prompt | spec, target_rows, populate } -> dataset (202 when a run starts)
 //   GET  /v1/datasets/{id}       -> { id, status, row_count, run: { id, status, error? } }
-//   GET  /v1/datasets/{id}/rows  -> { data: [ { <column>: value, ... } ], truncated, next_cursor }
+//   GET  /v1/datasets/{id}/rows  -> { columns, rows: [ { _id, data: { <column>: value } } ], truncated, next_cursor }
 // Dataset status: empty | populating | ready | failed | cancelled.
 // Run status: queued | running | done | failed | cancelled. Per the docs
 // guide, "a failed run explains why in run.error" — so the client surfaces
@@ -226,22 +226,66 @@ export async function tinysetGet(id: string): Promise<TinySetDataset> {
   return parseDataset(data, id);
 }
 
-export async function tinysetRows(id: string, limit = 100): Promise<Record<string, unknown>[]> {
-  const data = await tfJson(`${DATASETS_URL}/${id}/rows?limit=${limit}`, { method: "GET" }, 20000);
-  const rows: any[] = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
-  return rows.map((r) => {
-    // Rows are documented as flat cell objects keyed by column name, but the
-    // run event stream describes a row as { row_id, data: { ...cells } }.
-    // Unwrap the wrapped shape if it ever shows up here so cell lookups by
-    // column name work either way.
-    if (r && typeof r === "object") {
-      const cells = (r as Record<string, unknown>).data;
-      if (cells && typeof cells === "object" && !Array.isArray(cells)) {
-        return cells as Record<string, unknown>;
-      }
+export interface TinySetRowsPage {
+  rows: Record<string, unknown>[];
+  /** Top-level keys of the /rows response envelope (diagnostics). */
+  envelopeKeys: string[];
+  truncated: boolean;
+}
+
+function unwrapRow(r: unknown): Record<string, unknown> {
+  // Actual row shape (per @tiny-fish/sdk datasetRowSchema):
+  //   { _id: string, data: { <column>: value, ... } }
+  // Cells live in the row's `data` property. A flat row (cells at top level)
+  // is passed through untouched, defensively.
+  if (r && typeof r === "object") {
+    const cells = (r as Record<string, unknown>).data;
+    if (cells && typeof cells === "object" && !Array.isArray(cells)) {
+      return cells as Record<string, unknown>;
     }
-    return r as Record<string, unknown>;
-  });
+  }
+  return r as Record<string, unknown>;
+}
+
+/**
+ * Read a dataset's rows. The actual envelope (per @tiny-fish/sdk
+ * datasetRowsResponseSchema) is:
+ *   { columns: [...], rows: [{ _id, data: { ...cells } }], truncated, next_cursor }
+ * — the array key is `rows`, NOT the `data` key the list endpoint uses.
+ * Pass 7's first version read `data.data`, parsed [] from every response,
+ * and reported full datasets as empty while row_count said otherwise.
+ * The `data`-array and bare-array shapes are still accepted defensively.
+ * Follows `next_cursor` (as `after`) while the page says `truncated`.
+ */
+export async function tinysetRowsPage(id: string, limit = 100): Promise<TinySetRowsPage> {
+  const rows: Record<string, unknown>[] = [];
+  let envelopeKeys: string[] = [];
+  let truncated = false;
+  let after: string | null = null;
+  for (let page = 0; page < 3 && rows.length < limit; page++) {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (after) qs.set("after", after);
+    const data = await tfJson(`${DATASETS_URL}/${id}/rows?${qs.toString()}`, { method: "GET" }, 20000);
+    if (page === 0 && data && typeof data === "object" && !Array.isArray(data)) {
+      envelopeKeys = Object.keys(data).slice(0, 8);
+    }
+    const raw: any[] = Array.isArray(data?.rows)
+      ? data.rows
+      : Array.isArray(data?.data)
+        ? data.data
+        : Array.isArray(data)
+          ? data
+          : [];
+    for (const r of raw) rows.push(unwrapRow(r));
+    truncated = Boolean(data?.truncated);
+    after = typeof data?.next_cursor === "string" ? data.next_cursor : null;
+    if (!truncated || !after) break;
+  }
+  return { rows, envelopeKeys, truncated };
+}
+
+export async function tinysetRows(id: string, limit = 100): Promise<Record<string, unknown>[]> {
+  return (await tinysetRowsPage(id, limit)).rows;
 }
 
 export function hostOf(url: string): string {
